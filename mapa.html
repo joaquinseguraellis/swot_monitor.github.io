@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mapa APRHI-PIHC y lagunas SWOT</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font: 14px/1.4 system-ui, sans-serif; color: #222; }
+  body { display: flex; }
+  #mapa { flex: 1; min-width: 0; }
+  #panel { width: 360px; flex: none; overflow-y: auto; padding: 10px 14px; box-sizing: border-box; border-left: 1px solid #ccc; background: #fff; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #555; margin: 14px 0 6px; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+  h2:first-child { margin-top: 0; }
+  label { display: block; cursor: pointer; padding: 1px 0; }
+  .muestra { display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 2px; vertical-align: -1px; border: 1px solid #333; }
+  #leyenda .barra { height: 12px; border: 1px solid #888; margin-top: 4px; }
+  #leyenda .extremos { display: flex; justify-content: space-between; font-size: 12px; }
+  #leyenda .sd { font-size: 12px; margin-top: 2px; }
+  #serie-contenedor { position: relative; height: 240px; }
+  #serie-info { font-size: 12px; color: #444; margin: 4px 0; }
+  #serie-info strong { font-size: 14px; color: #222; }
+  .popup td, .popup th { padding: 1px 8px 1px 0; vertical-align: top; text-align: left; }
+  .popup th { font-weight: 600; }
+  @media (max-width: 800px) {
+    body { flex-direction: column; }
+    #mapa { height: 55%; flex: none; }
+    #panel { width: auto; flex: 1; border-left: 0; border-top: 1px solid #ccc; }
+  }
+</style>
+</head>
+<body>
+<div id="mapa" role="application" aria-label="Mapa interactivo"></div>
+<aside id="panel" aria-label="Panel de control">
+  <h2>Capas</h2>
+  <div id="capas"></div>
+  <div id="error-satelite" role="status" aria-live="polite"></div>
+  <div id="errores-wms" role="status" aria-live="polite"></div>
+
+  <h2>Colorear lagunas por</h2>
+  <div id="metricas"></div>
+  <div id="leyenda" aria-live="polite"></div>
+
+  <h2>Serie temporal</h2>
+  <div id="serie-info">Hacé clic en una laguna para ver su serie.</div>
+  <div id="serie-contenedor"><canvas id="serie" role="img" aria-label="Series de variación mensual e interanual de la laguna seleccionada"></canvas></div>
+</aside>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="capas.js"></script>
+<script src="lagunas.js"></script>
+<script>
+  const fmt = (v, d = 2) => v.toLocaleString('es-AR', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const mapa = L.map('mapa', { zoomControl: false, preferCanvas: true });
+  const satelite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics'
+  }).addTo(mapa);
+  mapa.attributionControl.addAttribution('Lagunas: NASA SWOT L2_HR_PIXC');
+  mapa.createPane('lagunas').style.zIndex = 450;
+
+  // ---------- Capas APRHI-PIHC ----------
+  const ACTIVAS = ['Unidades de gestion hidrica', 'Embalses', 'Cursos de agua 2021'];
+  const grupo = L.featureGroup();
+  const contCapas = document.getElementById('capas');
+
+  function agregarCheck(texto, color, claro, activa, onChange) {
+    const lab = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = activa;
+    cb.addEventListener('change', () => onChange(cb.checked));
+    lab.appendChild(cb);
+    if (color) {
+      const m = document.createElement('span');
+      m.className = 'muestra';
+      m.style.background = claro ? color + '55' : color;
+      lab.appendChild(m);
+    } else {
+      lab.appendChild(document.createTextNode(' '));
+    }
+    lab.appendChild(document.createTextNode(texto));
+    contCapas.appendChild(lab);
+  }
+
+  const errorSatelite = document.getElementById('error-satelite');
+  satelite.on('tileerror', () => {
+    errorSatelite.textContent = 'No se pudo cargar parte de la imagen satelital. Compruebe la conexión o pruebe nuevamente.';
+  });
+  agregarCheck('Imagen satelital (Esri)', null, false, true, on => {
+    errorSatelite.textContent = '';
+    if (on) satelite.addTo(mapa).bringToBack();
+    else mapa.removeLayer(satelite);
+  });
+
+  function popup(props) {
+    const tabla = document.createElement('table');
+    tabla.className = 'popup';
+    for (const [k, v] of Object.entries(props)) {
+      if (v === null || v === '' || k === 'GlobalID') continue;
+      const tr = tabla.insertRow();
+      const th = document.createElement('th');
+      th.textContent = k;
+      tr.appendChild(th);
+      tr.insertCell().textContent = typeof v === 'number' ? v.toLocaleString('es-AR') : v;
+    }
+    return tabla;
+  }
+
+  CAPAS.forEach(c => {
+    const esLinea = c.tipo === 'linea';
+    const capa = L.geoJSON(c.datos, {
+      style: { color: c.color, weight: esLinea ? 2.5 : 3, fillColor: c.color, fillOpacity: esLinea ? 0 : 0.15 },
+      onEachFeature: (f, l) => l.bindPopup(() => popup(f.properties), { maxWidth: 320, maxHeight: 260 })
+    });
+    const activa = ACTIVAS.includes(c.nombre);
+    if (activa) capa.addTo(mapa);
+    agregarCheck(c.nombre, c.color, !esLinea, activa, on => on ? capa.addTo(mapa) : mapa.removeLayer(capa));
+    grupo.addLayer(capa);
+  });
+
+  function agregarCapaIdecor(nombre, layer) {
+    const error = document.createElement('div');
+    document.getElementById('errores-wms').appendChild(error);
+    const capa = L.tileLayer.wms('https://idecor-ws.mapascordoba.gob.ar/geoserver/idecor/wms', {
+      layers: layer,
+      format: 'image/png',
+      transparent: true,
+      version: '1.1.1',
+      attribution: 'IDECOR'
+    });
+    capa.on('tileerror', () => {
+      error.textContent = 'No se pudo cargar parte de ' + nombre + '. Compruebe la conexión o pruebe nuevamente.';
+    });
+    agregarCheck(nombre + ' (IDECOR)', null, false, false, on => {
+      error.textContent = '';
+      if (on) capa.addTo(mapa);
+      else mapa.removeLayer(capa);
+    });
+  }
+  agregarCapaIdecor('Vialidad: Red Nacional', 'red_vial_nacional');
+  agregarCapaIdecor('Vialidad: Red Provincial', 'red_vial_provincial');
+  agregarCapaIdecor('Demarcación: Localidades (puntos)', 'localidad_punto');
+
+  // ---------- Lagunas SWOT ----------
+  const rg = LAGUNAS_META.rango;
+  const PAL_DIV = ['#2166ac', '#67a9cf', '#f7f7f7', '#ef8a62', '#b2182b'];   // descenso (azul) -> ascenso (rojo)
+  const METRICAS = [
+    { id: 'd_month_m', nombre: 'Variación vs. mes anterior (m)',   min: -rg.d_month_m, max: rg.d_month_m, pal: PAL_DIV, u: 'm', d: 2 },
+    { id: 'd_yoy_m',   nombre: 'Variación interanual (m)',         min: -rg.d_yoy_m,   max: rg.d_yoy_m,   pal: PAL_DIV, u: 'm', d: 2 },
+  ];
+  const SIN_DATO = '#bdbdbd';
+  let metrica = METRICAS[0];
+  let seleccionada = null;
+
+  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  function color(pal, t) {
+    t = Math.min(1, Math.max(0, t)) * (pal.length - 1);
+    const i = Math.min(Math.floor(t), pal.length - 2), f = t - i;
+    const a = hex(pal[i]), b = hex(pal[i + 1]);
+    return 'rgb(' + a.map((x, k) => Math.round(x + (b[k] - x) * f)).join(',') + ')';
+  }
+  const colorDe = v => v == null ? SIN_DATO : color(metrica.pal, (v - metrica.min) / (metrica.max - metrica.min));
+
+  function estilo(f) {
+    const v = f.properties[metrica.id];
+    const sel = seleccionada === f.properties.id;
+    return { pane: 'lagunas', renderer: renderLagunas, color: sel ? '#000' : colorDe(v), weight: sel ? 5 : 3,
+             fillColor: colorDe(v), fillOpacity: v == null ? 0.35 : 0.85 };
+  }
+  const renderLagunas = L.canvas({ pane: 'lagunas' });
+  const capaLagunas = L.geoJSON(LAGUNAS, {
+    style: estilo,
+    onEachFeature: (f, l) => {
+      l.bindTooltip(() => {
+        const v = f.properties[metrica.id];
+        return v == null ? 'Sin datos suficientes para comparar' : fmt(v, metrica.d) + ' ' + metrica.u;
+      }, { sticky: true });
+      l.on('click', () => mostrarSerie(f.properties));
+    }
+  }).addTo(mapa);
+  agregarCheck('Lagunas SWOT (≥ 10 ha)', '#2166ac', false, true, on => on ? capaLagunas.addTo(mapa) : mapa.removeLayer(capaLagunas));
+
+  // Selector de variable + leyenda
+  const contMet = document.getElementById('metricas');
+  METRICAS.forEach((m, i) => {
+    const lab = document.createElement('label');
+    const rb = document.createElement('input');
+    rb.type = 'radio'; rb.name = 'metrica'; rb.checked = i === 0;
+    rb.addEventListener('change', () => { metrica = m; capaLagunas.setStyle(estilo); leyenda(); });
+    lab.append(rb, document.createTextNode(' ' + m.nombre));
+    contMet.appendChild(lab);
+  });
+
+  function leyenda() {
+    const cont = document.getElementById('leyenda');
+    cont.replaceChildren();
+    const barra = document.createElement('div');
+    barra.className = 'barra';
+    barra.style.background = 'linear-gradient(to right,' + metrica.pal.join(',') + ')';
+    const ext = document.createElement('div');
+    ext.className = 'extremos';
+    const sg = v => (v > 0 ? '+' : '') + fmt(v, metrica.d);
+    ext.append(...[metrica.min, metrica.max].map(v => Object.assign(document.createElement('span'), { textContent: sg(v) + ' ' + metrica.u })));
+    const sd = document.createElement('div');
+    sd.className = 'sd';
+    const m = document.createElement('span');
+    m.className = 'muestra'; m.style.background = SIN_DATO;
+    sd.append(m, document.createTextNode('Sin datos suficientes para comparar (mes de referencia: ' + LAGUNAS_META.ref_month + ')'));
+    cont.append(barra, ext, sd);
+  }
+  leyenda();
+
+  // ---------- Serie temporal ----------
+  const epoch = Date.parse(LAGUNAS_META.epoch + 'T00:00:00Z');
+  const mesDia = d => new Date(epoch + d * 864e5).toLocaleDateString('es-AR', { timeZone: 'UTC', month: 'short', year: '2-digit' });
+  const grafico = new Chart(document.getElementById('serie'), {
+    type: 'line',
+    data: { datasets: [
+      { label: 'Variación mensual', data: [], borderColor: '#0072b2', backgroundColor: '#0072b2', pointRadius: 3, borderWidth: 1.5 },
+      { label: 'Variación interanual', data: [], borderColor: '#d55e00', backgroundColor: '#d55e00', borderDash: [5, 3], pointRadius: 3, borderWidth: 1.5 }
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      parsing: false,
+      plugins: { tooltip: { callbacks: {
+        title: items => mesDia(items[0].parsed.x),
+        label: item => item.dataset.label + ': ' + fmt(item.parsed.y, 2) + ' m'
+      } } },
+      scales: {
+        x: { type: 'linear', ticks: { maxTicksLimit: 6, callback: v => mesDia(v) } },
+        y: { title: { display: true, text: 'Variación [m]' } }
+      }
+    }
+  });
+
+  function mostrarSerie(p) {
+    seleccionada = p.id;
+    capaLagunas.setStyle(estilo);
+    const s = LAGUNAS_SERIES[p.id];
+    grafico.data.datasets.forEach((dataset, i) => {
+      dataset.data = s ? LAGUNAS_META.meses.map((mes, j) => ({ x: mes, y: s[i][j] })) : [];
+    });
+    grafico.update();
+
+    const info = document.getElementById('serie-info');
+    info.replaceChildren();
+    const t = document.createElement('strong');
+    t.textContent = 'Laguna ' + p.id;
+    const partes = ['Área: ' + fmt(p.area_ha, 1) + ' ha', p.n_months + ' meses con nivel'];
+    METRICAS.forEach(m => { if (p[m.id] != null) partes.push(m.nombre + ': ' + fmt(p[m.id], m.d)); });
+    ['mensual', 'interanual'].forEach((nombre, i) => {
+      if (!s || s[i].every(v => v === null)) partes.push('Sin datos para variación ' + nombre);
+    });
+    info.append(t, document.createElement('br'), document.createTextNode(partes.join(' · ')));
+  }
+
+  mapa.fitBounds(grupo.getBounds().extend(capaLagunas.getBounds()));
+</script>
+</body>
+</html>
